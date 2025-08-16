@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Query, Request, Response
+from fastapi import FastAPI, APIRouter, HTTPException, Query, Request, Response, UploadFile, File
 from fastapi.responses import JSONResponse, StreamingResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 import httpx
 import time
 import csv
-from io import StringIO
+from io import StringIO, BytesIO
 from collections import deque, defaultdict
 from statistics import median
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
@@ -36,7 +36,7 @@ db = client[os.environ['DB_NAME']]
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
 
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 LOGGER = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
@@ -159,7 +159,6 @@ class Telemetry:
         })
 
     def snapshot(self):
-        # Compute simple stats per provider across models
         prov_stats: Dict[str, Dict[str, Any]] = {}
         for (provider, model), vals in self.latencies.items():
             if not vals:
@@ -170,7 +169,6 @@ class Telemetry:
             p95 = arr_sorted[int(0.95 * (len(arr_sorted)-1))]
             stat = prov_stats.setdefault(provider, {"models": {}, "p95": 0.0, "p50": 0.0})
             stat["models"][model] = {"count": len(arr), "p50": p50, "p95": p95}
-        # Aggregate provider-wide
         for provider, s in prov_stats.items():
             vals = []
             for m in s["models"].values():
@@ -194,34 +192,55 @@ MODEL_MAP: Dict[str, Dict[str, Optional[str]]] = {
         "together": None,
         "emergent": "gpt-4o-mini",
         "local": "gpt-4o-mini",
+        "deepseek": None,
     },
     "claude-3.7-sonnet": {
         "openrouter": "anthropic/claude-3.7-sonnet",
         "together": None,
         "emergent": "claude-3.7-sonnet",
         "local": "claude-3.7-sonnet",
+        "deepseek": None,
     },
     "llama-3.1-70b": {
         "openrouter": "meta-llama/llama-3.1-70b-instruct",
         "together": "meta-llama/Llama-3.1-70B-Instruct-Turbo",
         "emergent": "llama-3.1-70b",
         "local": "llama3.1:70b",
+        "deepseek": None,
     },
+    "qwen2.5-72b-instruct": {
+        "openrouter": "qwen/qwen2.5-72b-instruct",
+        "together": "Qwen/Qwen2.5-72B-Instruct",
+        "emergent": "qwen2.5-72b-instruct",
+        "local": "qwen2.5:72b",
+        "deepseek": None,
+    },
+    "deepseek-chat": {
+        "deepseek": "deepseek-chat",
+        "openrouter": None,
+        "together": None,
+        "emergent": None,
+        "local": None,
+    }
 }
 
 # LLM Orchestrator with breaker and retries
 class LLMOrchestrator:
     def __init__(self):
+        # Providers
         self.local_base = os.environ.get("LLM_LOCAL_BASE_URL")
         self.together_base = os.environ.get("TOGETHER_BASE_URL", "https://api.together.xyz/v1")
         self.together_key = os.environ.get("TOGETHER_API_KEY")
         self.openrouter_base = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
         self.openrouter_key = os.environ.get("OPENROUTER_API_KEY")
+        self.deepseek_base = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
+        self.deepseek_key = os.environ.get("DEEPSEEK_API_KEY")
         self.timeout = float(os.environ.get("LLM_TIMEOUT", "30"))
         self.enable_fallback = os.environ.get("ENABLE_LLM_FALLBACK", "true").lower() == "true"
         self.emergent_key = os.environ.get("EMERGENT_LLM_KEY")
         self.emergent_client = EmergentLLM(api_key=self.emergent_key) if (EmergentLLM and self.emergent_key) else None
-        self.order = ["local", "together", "openrouter", "emergent"]
+        # Order: local → openrouter → deepseek → together → emergent
+        self.order = ["local", "openrouter", "deepseek", "together", "emergent"]
         now = 0
         self.breakers: Dict[str, Dict[str, Any]] = {p: {"open": False, "until": now, "failures": 0, "last_error": None} for p in self.order}
 
@@ -260,7 +279,7 @@ class LLMOrchestrator:
         m = MODEL_MAP.get(friendly, {})
         return m.get(provider) or friendly
 
-    # Message normalization to OpenAI-style blocks
+    # Message normalization
     def _to_provider_messages(self, messages: List[Dict[str, Any]], image_url: Optional[str] = None, image_b64: Optional[str] = None, image_mime: Optional[str] = None):
         out = []
         for m in messages:
@@ -268,7 +287,6 @@ class LLMOrchestrator:
             text = m.get("content", "")
             content = [{"type": "text", "text": text}]
             out.append({"role": role, "content": content})
-        # Append image to last user message if present
         if (image_url or image_b64) and out:
             if out[-1]["role"] != "user":
                 out.append({"role": "user", "content": []})
@@ -284,6 +302,7 @@ class LLMOrchestrator:
             r.raise_for_status()
             return r.json()
 
+    # Providers
     async def _local_chat(self, payload_openai: Dict[str, Any], stream: bool = False) -> Any:
         if not self.local_base:
             raise RuntimeError("Local not configured")
@@ -292,7 +311,6 @@ class LLMOrchestrator:
                 data = await self._post_json(f"{self.local_base}/v1/chat/completions", payload_openai)
                 return data.get("choices", [{}])[0].get("message", {}).get("content", "")
             except Exception:
-                # try Ollama-compatible
                 ollama_payload = {
                     "model": payload_openai.get("model", "llama3"),
                     "messages": payload_openai.get("messages", []),
@@ -301,7 +319,6 @@ class LLMOrchestrator:
                 data = await self._post_json(f"{self.local_base}/api/chat", ollama_payload)
                 return data.get("message", {}).get("content", "")
         else:
-            # Stream via OpenAI SSE style; fallback to single chunk
             async def gen() -> AsyncGenerator[str, None]:
                 try:
                     async with httpx.AsyncClient(timeout=self.timeout) as client:
@@ -314,16 +331,12 @@ class LLMOrchestrator:
                                     break
                                 try:
                                     j = httpx.Response(200, content=data).json()
-                                except Exception:
-                                    continue
-                                try:
                                     delta = j.get("choices", [{}])[0].get("delta", {}).get("content")
                                     if delta:
                                         yield delta
                                 except Exception:
                                     continue
                 except Exception:
-                    # fallback non-stream
                     text = await self._local_chat(payload_openai, stream=False)
                     if text:
                         yield text
@@ -350,11 +363,11 @@ class LLMOrchestrator:
                                     break
                                 try:
                                     j = httpx.Response(200, content=data).json()
+                                    delta = j.get("choices", [{}])[0].get("delta", {}).get("content")
+                                    if delta:
+                                        yield delta
                                 except Exception:
                                     continue
-                                delta = j.get("choices", [{}])[0].get("delta", {}).get("content")
-                                if delta:
-                                    yield delta
                 except Exception:
                     yield ""
                 yield ""
@@ -385,11 +398,42 @@ class LLMOrchestrator:
                                     break
                                 try:
                                     j = httpx.Response(200, content=data).json()
+                                    delta = j.get("choices", [{}])[0].get("delta", {}).get("content")
+                                    if delta:
+                                        yield delta
                                 except Exception:
                                     continue
-                                delta = j.get("choices", [{}])[0].get("delta", {}).get("content")
-                                if delta:
-                                    yield delta
+                except Exception:
+                    yield ""
+                yield ""
+            return gen()
+
+    async def _deepseek_chat(self, payload_openai: Dict[str, Any], stream: bool = False) -> Any:
+        if not self.deepseek_key:
+            raise RuntimeError("DeepSeek not configured")
+        headers = {"Authorization": f"Bearer {self.deepseek_key}", "Content-Type": "application/json"}
+        url = f"{self.deepseek_base}/chat/completions"
+        if not stream:
+            data = await self._post_json(url, payload_openai, headers)
+            return data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        else:
+            async def gen() -> AsyncGenerator[str, None]:
+                try:
+                    async with httpx.AsyncClient(timeout=self.timeout) as client:
+                        async with client.stream("POST", url, json={**payload_openai, "stream": True}, headers=headers) as resp:
+                            async for line in resp.aiter_lines():
+                                if not line or not line.startswith("data: "):
+                                    continue
+                                data = line[6:]
+                                if data == "[DONE]":
+                                    break
+                                try:
+                                    j = httpx.Response(200, content=data).json()
+                                    delta = j.get("choices", [{}])[0].get("delta", {}).get("content")
+                                    if delta:
+                                        yield delta
+                                except Exception:
+                                    continue
                 except Exception:
                     yield ""
                 yield ""
@@ -402,7 +446,6 @@ class LLMOrchestrator:
             resp = self.emergent_client.chat.completions.create(model=model, messages=messages)
             return resp.choices[0].message.content
         else:
-            # Fallback: stream not guaranteed; emit single chunk
             resp = self.emergent_client.chat.completions.create(model=model, messages=messages)
             async def gen() -> AsyncGenerator[str, None]:
                 yield resp.choices[0].message.content
@@ -412,6 +455,7 @@ class LLMOrchestrator:
     async def _call_with_retry(self, func, provider: str, model: str, *args, stream: bool = False, **kwargs):
         delay = 0.25
         max_retries = 2
+        start = None
         for attempt in range(max_retries + 1):
             start = time.time()
             try:
@@ -438,8 +482,7 @@ class LLMOrchestrator:
                 raise
 
     async def chat(self, messages: List[Dict[str, Any]], model: str = "default", temperature: Optional[float] = None, max_tokens: Optional[int] = None, provider: Optional[str] = None, image_url: Optional[str] = None, image_b64: Optional[str] = None, image_mime: Optional[str] = None) -> Dict[str, Any]:
-        # Build payload
-        order_default = ["local", "together", "openrouter", "emergent"]
+        order_default = ["local", "openrouter", "deepseek", "together", "emergent"]
         order = []
         if provider in order_default:
             order = [provider] + [p for p in order_default if p != provider] if self.enable_fallback else [provider]
@@ -461,10 +504,12 @@ class LLMOrchestrator:
             try:
                 if p == "local":
                     content = await self._call_with_retry(self._local_chat, p, resolved_model, payload, stream=False)
-                elif p == "together":
-                    content = await self._call_with_retry(self._together_chat, p, resolved_model, payload, stream=False)
                 elif p == "openrouter":
                     content = await self._call_with_retry(self._openrouter_chat, p, resolved_model, payload, stream=False)
+                elif p == "deepseek":
+                    content = await self._call_with_retry(self._deepseek_chat, p, resolved_model, payload, stream=False)
+                elif p == "together":
+                    content = await self._call_with_retry(self._together_chat, p, resolved_model, payload, stream=False)
                 else:
                     content = await self._call_with_retry(self._emergent_chat, p, resolved_model, resolved_model, norm_messages, stream=False)
                 return {"provider": p, "model": resolved_model, "content": content}
@@ -474,7 +519,7 @@ class LLMOrchestrator:
         raise HTTPException(status_code=503, detail={"message": "All providers unavailable", "chain": errors})
 
     async def stream(self, messages: List[Dict[str, Any]], model: str = "default", provider: Optional[str] = None, temperature: Optional[float] = None, max_tokens: Optional[int] = None, image_url: Optional[str] = None, image_b64: Optional[str] = None, image_mime: Optional[str] = None) -> AsyncGenerator[str, None]:
-        order_default = ["local", "together", "openrouter", "emergent"]
+        order_default = ["local", "openrouter", "deepseek", "together", "emergent"]
         order = []
         if provider in order_default:
             order = [provider] + [p for p in order_default if p != provider] if self.enable_fallback else [provider]
@@ -497,13 +542,14 @@ class LLMOrchestrator:
             try:
                 if p == "local":
                     gen = await self._call_with_retry(self._local_chat, p, resolved_model, payload, stream=True)
-                elif p == "together":
-                    gen = await self._call_with_retry(self._together_chat, p, resolved_model, payload, stream=True)
                 elif p == "openrouter":
                     gen = await self._call_with_retry(self._openrouter_chat, p, resolved_model, payload, stream=True)
+                elif p == "deepseek":
+                    gen = await self._call_with_retry(self._deepseek_chat, p, resolved_model, payload, stream=True)
+                elif p == "together":
+                    gen = await self._call_with_retry(self._together_chat, p, resolved_model, payload, stream=True)
                 else:
                     gen = await self._call_with_retry(self._emergent_chat, p, resolved_model, resolved_model, norm_messages, stream=True)
-                # Yield chunks
                 async for chunk in gen:
                     if chunk:
                         yield chunk
@@ -513,7 +559,6 @@ class LLMOrchestrator:
                 telemetry.record_error(p, resolved_model, "upstream_error", 502, str(e))
                 last_errors.append(self._err(p, 502, "upstream_error", str(e)))
                 continue
-        # if all failed, emit error as last event
         yield "\n[ERROR]: All providers unavailable"
 
 # Async sleep helper
@@ -552,6 +597,7 @@ async def providers_status():
         "local": bool(llm.local_base),
         "together": bool(llm.together_key),
         "openrouter": bool(llm.openrouter_key),
+        "deepseek": bool(llm.deepseek_key),
         "emergent": bool(llm.emergent_client),
         "breakers": llm.breakers,
     }
@@ -643,7 +689,7 @@ async def get_config():
     admin_enabled = os.environ.get("ADMIN_ENABLED", "false").lower() == "true"
     return {"admin_enabled": admin_enabled}
 
-# AI endpoints
+# AI endpoints (non-stream & stream)
 @api_router.post("/ai/chat")
 async def ai_chat(req: AIChatRequest):
     if LOG_SAMPLES:
@@ -697,7 +743,12 @@ async def ai_chat_stream(req: AIChatRequest):
             err = {"message": str(e)}
             yield f"data: {err}\n\n".encode()
             yield b"data: [DONE]\n\n"
-    return StreamingResponse(event_gen(), media_type="text/event-stream")
+    headers = {
+        "Cache-Control": "no-cache, no-transform",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+    return StreamingResponse(event_gen(), media_type="text/event-stream", headers=headers)
 
 @api_router.post("/ai/summarize")
 async def ai_summarize(req: AISummaryRequest):
@@ -745,6 +796,76 @@ async def ai_insights(req: AIInsightsRequest):
     except Exception as e:
         LOGGER.exception("AI insights failed")
         raise HTTPException(status_code=503, detail="AI insights failed")
+
+# ElevenLabs TTS
+ELEVEN_BASE = os.environ.get("ELEVENLABS_BASE_URL", "https://api.elevenlabs.io/v1")
+ELEVEN_KEY = os.environ.get("ELEVENLABS_API_KEY")
+
+@api_router.get("/tts/voices")
+async def tts_voices():
+    if not ELEVEN_KEY:
+        raise HTTPException(status_code=400, detail="ELEVENLABS_API_KEY not set")
+    headers = {"Accept": "application/json", "xi-api-key": ELEVEN_KEY}
+    async with httpx.AsyncClient(timeout=30.0) as client_http:
+        r = await client_http.get(f"{ELEVEN_BASE}/voices", headers=headers)
+        r.raise_for_status()
+        return r.json()
+
+class TTSRequestBody(BaseModel):
+    text: str
+    voice_id: str
+    model_id: Optional[str] = Field(default="eleven_multilingual_v2")
+
+@api_router.post("/tts/synthesize")
+async def tts_synthesize(body: TTSRequestBody):
+    if not ELEVEN_KEY:
+        raise HTTPException(status_code=400, detail="ELEVENLABS_API_KEY not set")
+    headers = {"Accept": "application/json", "xi-api-key": ELEVEN_KEY, "Content-Type": "application/json"}
+    data = {
+        "text": body.text,
+        "model_id": body.model_id or "eleven_multilingual_v2",
+        "voice_settings": {"stability": 0.5, "similarity_boost": 0.8, "style": 0.0, "use_speaker_boost": True},
+    }
+    url = f"{ELEVEN_BASE}/text-to-speech/{body.voice_id}"
+    async with httpx.AsyncClient(timeout=60.0) as client_http:
+        r = await client_http.post(url, headers=headers, json=data)
+        r.raise_for_status()
+        audio = r.content
+        return Response(content=audio, media_type="audio/mpeg", headers={"Content-Disposition": "attachment; filename=speech.mp3"})
+
+# Deepgram STT
+DEEPGRAM_BASE = os.environ.get("DEEPGRAM_BASE_URL", "https://api.deepgram.com/v1")
+DEEPGRAM_KEY = os.environ.get("DEEPGRAM_API_KEY")
+
+class STTUrlBody(BaseModel):
+    url: str
+    options: Optional[Dict[str, Any]] = Field(default_factory=dict)
+
+@api_router.post("/stt/transcribe-url")
+async def stt_transcribe_url(body: STTUrlBody):
+    if not DEEPGRAM_KEY:
+        raise HTTPException(status_code=400, detail="DEEPGRAM_API_KEY not set")
+    headers = {"Authorization": f"Token {DEEPGRAM_KEY}", "Content-Type": "application/json"}
+    params = {"smart_format": True, "diarize": True, "paragraphs": True, "utterances": True, "model": "nova-2"}
+    params.update(body.options or {})
+    async with httpx.AsyncClient(timeout=120.0) as client_http:
+        r = await client_http.post(f"{DEEPGRAM_BASE}/listen", headers=headers, params=params, json={"url": body.url})
+        r.raise_for_status()
+        return r.json()
+
+@api_router.post("/stt/transcribe-file")
+async def stt_transcribe_file(file: UploadFile = File(...)):
+    if not DEEPGRAM_KEY:
+        raise HTTPException(status_code=400, detail="DEEPGRAM_API_KEY not set")
+    if not file.content_type or not file.content_type.startswith("audio/"):
+        raise HTTPException(status_code=400, detail="Invalid file type. Audio files only.")
+    headers = {"Authorization": f"Token {DEEPGRAM_KEY}", "Content-Type": file.content_type}
+    params = {"smart_format": True, "diarize": True, "paragraphs": True, "utterances": True, "model": "nova-2"}
+    data = await file.read()
+    async with httpx.AsyncClient(timeout=120.0) as client_http:
+        r = await client_http.post(f"{DEEPGRAM_BASE}/listen", headers=headers, params=params, content=data)
+        r.raise_for_status()
+        return r.json()
 
 # Mount router
 app.include_router(api_router)
