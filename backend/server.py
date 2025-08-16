@@ -1,4 +1,5 @@
 from fastapi import FastAPI, APIRouter, HTTPException, Query, Request, Response
+from fastapi.responses import JSONResponse, StreamingResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -6,13 +7,15 @@ import os
 import logging
 from pathlib import Path
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any, Literal
+from typing import List, Optional, Dict, Any, Literal, AsyncGenerator
 import uuid
 from datetime import datetime, timedelta
 import httpx
 import time
 import csv
 from io import StringIO
+from collections import deque, defaultdict
+from statistics import median
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
 # Emergent Integrations
@@ -33,13 +36,18 @@ db = client[os.environ['DB_NAME']]
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
 
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 LOGGER = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+LOG_SAMPLES = os.environ.get("LOG_SAMPLES", "false").lower() == "true"
 
 # Prometheus metrics
 REQ_COUNTER = Counter("http_requests_total", "Total HTTP requests", ["method", "path", "status"])
 REQ_LATENCY = Histogram("http_request_duration_seconds", "HTTP request latency", ["method", "path"]) 
+LLM_REQUESTS = Counter("llm_requests_total", "LLM requests", ["provider", "model"])
+LLM_FAILURES = Counter("llm_failures_total", "LLM failures", ["provider", "model", "code"])
+LLM_LATENCY = Histogram("llm_latency_seconds", "LLM latency", ["provider", "model"]) 
 
 @app.middleware("http")
 async def metrics_logging_middleware(request: Request, call_next):
@@ -49,7 +57,6 @@ async def metrics_logging_middleware(request: Request, call_next):
     method = request.method
     try:
         response: Response = await call_next(request)
-        status = response.status_code
         return response
     finally:
         duration = time.time() - start
@@ -92,6 +99,31 @@ class PurgeRequest(BaseModel):
     client_name: Optional[str] = None
     older_than_hours: Optional[int] = Field(default=None, ge=1)
 
+# AI schemas
+class AIChatMessage(BaseModel):
+    role: Literal["user", "assistant", "system"]
+    content: str
+
+class AIChatRequest(BaseModel):
+    messages: List[AIChatMessage]
+    model: Optional[str] = Field(default="default")
+    temperature: Optional[float] = Field(default=0.7)
+    max_tokens: Optional[int] = Field(default=500)
+    provider: Optional[str] = Field(default=None)
+    image_url: Optional[str] = Field(default=None)
+    image_b64: Optional[str] = Field(default=None)
+    image_mime: Optional[str] = Field(default=None)
+
+class AISummaryRequest(BaseModel):
+    hours: Optional[int] = Field(default=24, ge=1, le=168)
+    limit: Optional[int] = Field(default=200, ge=1, le=2000)
+    model: Optional[str] = Field(default="default")
+    temperature: Optional[float] = Field(default=0.3)
+
+class AIInsightsRequest(BaseModel):
+    hours: Optional[int] = Field(default=24, ge=1, le=720)
+    limit: Optional[int] = Field(default=500, ge=1, le=5000)
+
 # Helpers
 async def init_indexes():
     try:
@@ -107,19 +139,144 @@ def strip_mongo_id(doc: Dict[str, Any]) -> Dict[str, Any]:
     doc.pop("_id", None)
     return doc
 
-# LLM Orchestrator
+# Telemetry store
+class Telemetry:
+    def __init__(self):
+        self.latencies = defaultdict(lambda: deque(maxlen=500))  # key: (provider, model)
+        self.errors = deque(maxlen=200)  # list of {ts, provider, code, http_status, message}
+
+    def record_latency(self, provider: str, model: str, seconds: float):
+        self.latencies[(provider, model)].append(seconds)
+
+    def record_error(self, provider: str, model: str, code: str, http_status: int, message: str):
+        self.errors.append({
+            "ts": datetime.utcnow().isoformat(),
+            "provider": provider,
+            "model": model,
+            "code": code,
+            "http_status": http_status,
+            "message": message[:500],
+        })
+
+    def snapshot(self):
+        # Compute simple stats per provider across models
+        prov_stats: Dict[str, Dict[str, Any]] = {}
+        for (provider, model), vals in self.latencies.items():
+            if not vals:
+                continue
+            arr = list(vals)
+            arr_sorted = sorted(arr)
+            p50 = arr_sorted[int(0.5 * (len(arr_sorted)-1))]
+            p95 = arr_sorted[int(0.95 * (len(arr_sorted)-1))]
+            stat = prov_stats.setdefault(provider, {"models": {}, "p95": 0.0, "p50": 0.0})
+            stat["models"][model] = {"count": len(arr), "p50": p50, "p95": p95}
+        # Aggregate provider-wide
+        for provider, s in prov_stats.items():
+            vals = []
+            for m in s["models"].values():
+                vals.extend([m["p95"]])
+            s["p95"] = max(vals) if vals else 0.0
+            vals = []
+            for m in s["models"].values():
+                vals.extend([m["p50"]])
+            s["p50"] = median(vals) if vals else 0.0
+        return {
+            "providers": prov_stats,
+            "recent_errors": list(self.errors)[-20:],
+        }
+
+telemetry = Telemetry()
+
+# Model aliasing
+MODEL_MAP: Dict[str, Dict[str, Optional[str]]] = {
+    "gpt-4o-mini": {
+        "openrouter": "openai/gpt-4o-mini",
+        "together": None,
+        "emergent": "gpt-4o-mini",
+        "local": "gpt-4o-mini",
+    },
+    "claude-3.7-sonnet": {
+        "openrouter": "anthropic/claude-3.7-sonnet",
+        "together": None,
+        "emergent": "claude-3.7-sonnet",
+        "local": "claude-3.7-sonnet",
+    },
+    "llama-3.1-70b": {
+        "openrouter": "meta-llama/llama-3.1-70b-instruct",
+        "together": "meta-llama/Llama-3.1-70B-Instruct-Turbo",
+        "emergent": "llama-3.1-70b",
+        "local": "llama3.1:70b",
+    },
+}
+
+# LLM Orchestrator with breaker and retries
 class LLMOrchestrator:
     def __init__(self):
-        self.local_base = os.environ.get("LLM_LOCAL_BASE_URL")  # e.g. http://127.0.0.1:11434 or vLLM base
+        self.local_base = os.environ.get("LLM_LOCAL_BASE_URL")
         self.together_base = os.environ.get("TOGETHER_BASE_URL", "https://api.together.xyz/v1")
         self.together_key = os.environ.get("TOGETHER_API_KEY")
         self.openrouter_base = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
         self.openrouter_key = os.environ.get("OPENROUTER_API_KEY")
-        self.timeout = float(os.environ.get("LLM_TIMEOUT", "45"))
+        self.timeout = float(os.environ.get("LLM_TIMEOUT", "30"))
         self.enable_fallback = os.environ.get("ENABLE_LLM_FALLBACK", "true").lower() == "true"
-        # Emergent
         self.emergent_key = os.environ.get("EMERGENT_LLM_KEY")
         self.emergent_client = EmergentLLM(api_key=self.emergent_key) if (EmergentLLM and self.emergent_key) else None
+        self.order = ["local", "together", "openrouter", "emergent"]
+        now = 0
+        self.breakers: Dict[str, Dict[str, Any]] = {p: {"open": False, "until": now, "failures": 0, "last_error": None} for p in self.order}
+
+    # Breaker helpers
+    def _breaker_allows(self, p: str) -> bool:
+        b = self.breakers[p]
+        if not b["open"]:
+            return True
+        if time.time() >= b["until"]:
+            b["open"] = False
+            b["failures"] = 0
+            b["last_error"] = None
+            return True
+        return False
+
+    def _breaker_trip(self, p: str, cool: int = 60, err: Optional[str] = None):
+        b = self.breakers[p]
+        b["failures"] += 1
+        b["last_error"] = (err or "")[:300]
+        if b["failures"] >= 3:
+            b["open"] = True
+            b["until"] = time.time() + cool
+
+    # Error normalization
+    def _err(self, provider: str, http_status: int, code: str, message: str, retriable: bool = True):
+        return {
+            "provider": provider,
+            "http_status": http_status,
+            "code": code,
+            "message": message,
+            "retriable": retriable,
+        }
+
+    # Model resolving
+    def _resolve_model(self, provider: str, friendly: str) -> str:
+        m = MODEL_MAP.get(friendly, {})
+        return m.get(provider) or friendly
+
+    # Message normalization to OpenAI-style blocks
+    def _to_provider_messages(self, messages: List[Dict[str, Any]], image_url: Optional[str] = None, image_b64: Optional[str] = None, image_mime: Optional[str] = None):
+        out = []
+        for m in messages:
+            role = m.get("role", "user")
+            text = m.get("content", "")
+            content = [{"type": "text", "text": text}]
+            out.append({"role": role, "content": content})
+        # Append image to last user message if present
+        if (image_url or image_b64) and out:
+            if out[-1]["role"] != "user":
+                out.append({"role": "user", "content": []})
+            if image_url:
+                out[-1]["content"].append({"type": "image_url", "image_url": {"url": image_url}})
+            else:
+                out[-1]["content"].append({"type": "input_image", "image": {"data": image_b64, "mime_type": image_mime or "image/png"}})
+        return out
 
     async def _post_json(self, url: str, payload: Dict[str, Any], headers: Dict[str, str] = None) -> Dict[str, Any]:
         async with httpx.AsyncClient(timeout=self.timeout) as client:
@@ -127,139 +284,242 @@ class LLMOrchestrator:
             r.raise_for_status()
             return r.json()
 
-    async def _local_chat(self, payload_openai: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    async def _local_chat(self, payload_openai: Dict[str, Any], stream: bool = False) -> Any:
         if not self.local_base:
-            return None
-        # Try OpenAI-compatible first
-        try:
-            data = await self._post_json(f"{self.local_base}/v1/chat/completions", payload_openai)
-            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-            if content:
-                return {"provider": "local", "model": data.get("model", payload_openai.get("model", "default")), "content": content, "raw": data}
-        except Exception as e:
-            # Try Ollama-compatible /api/chat
+            raise RuntimeError("Local not configured")
+        if not stream:
             try:
+                data = await self._post_json(f"{self.local_base}/v1/chat/completions", payload_openai)
+                return data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            except Exception:
+                # try Ollama-compatible
                 ollama_payload = {
                     "model": payload_openai.get("model", "llama3"),
                     "messages": payload_openai.get("messages", []),
-                    "stream": False
+                    "stream": False,
                 }
                 data = await self._post_json(f"{self.local_base}/api/chat", ollama_payload)
-                content = data.get("message", {}).get("content")
-                if content:
-                    return {"provider": "local", "model": ollama_payload["model"], "content": content, "raw": data}
-            except Exception as e2:
-                LOGGER.warning(f"Local LLM failed (OpenAI and Ollama paths): {e} | {e2}")
-        return None
-
-    async def _together_chat(self, payload_openai: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        if not self.together_key:
-            return None
-        try:
-            headers = {"Authorization": f"Bearer {self.together_key}", "Content-Type": "application/json"}
-            data = await self._post_json(f"{self.together_base}/chat/completions", payload_openai, headers)
-            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-            if content:
-                return {"provider": "together", "model": data.get("model", payload_openai.get("model", "default")), "content": content, "raw": data}
-        except Exception as e:
-            LOGGER.warning(f"Together.ai failed: {e}")
-        return None
-
-    async def _openrouter_chat(self, payload_openai: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        if not self.openrouter_key:
-            return None
-        try:
-            headers = {
-                "Authorization": f"Bearer {self.openrouter_key}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": os.environ.get("OPENROUTER_REFERRER", "http://localhost"),
-                "X-Title": os.environ.get("OPENROUTER_TITLE", "Neo System")
-            }
-            data = await self._post_json(f"{self.openrouter_base}/chat/completions", payload_openai, headers)
-            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-            if content:
-                return {"provider": "openrouter", "model": data.get("model", payload_openai.get("model", "default")), "content": content, "raw": data}
-        except Exception as e:
-            LOGGER.warning(f"OpenRouter failed: {e}")
-        return None
-
-    async def _emergent_chat(self, payload_openai: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        if not self.emergent_client:
-            return None
-        try:
-            # Emergent Integrations accepts OpenAI-style messages and model routing using Universal Key
-            resp = self.emergent_client.chat.completions.create(
-                model=payload_openai.get("model", "gpt-4"),
-                messages=payload_openai.get("messages", []),
-            )
-            # resp.choices[0].message.content
-            content = getattr(resp.choices[0].message, "content", None) if hasattr(resp, "choices") else None
-            if content:
-                return {"provider": "emergent", "model": payload_openai.get("model", "gpt-4"), "content": content, "raw": None}
-        except Exception as e:
-            LOGGER.warning(f"Emergent provider failed: {e}")
-        return None
-
-    async def chat(self, messages: List[Dict[str, Any]], model: str = "default", temperature: Optional[float] = None, max_tokens: Optional[int] = None, provider: Optional[str] = None, image_url: Optional[str] = None) -> Dict[str, Any]:
-        # Build OpenAI-style payload
-        formatted_messages = []
-        for m in messages:
-            role = m.get("role", "user")
-            content = m.get("content", "")
-            formatted_messages.append({"role": role, "content": content})
-        if image_url:
-            if formatted_messages and formatted_messages[-1]["role"] == "user":
-                text_part = formatted_messages[-1]["content"]
-                formatted_messages[-1]["content"] = [
-                    {"type": "text", "text": text_part},
-                    {"type": "image_url", "image_url": {"url": image_url}}
-                ]
-            else:
-                formatted_messages.append({
-                    "role": "user",
-                    "content": [
-                        {"type": "image_url", "image_url": {"url": image_url}}
-                    ]
-                })
-
-        payload = {
-            "model": model,
-            "messages": formatted_messages,
-        }
-        if temperature is not None:
-            payload["temperature"] = temperature
-        if max_tokens is not None:
-            payload["max_tokens"] = max_tokens
-
-        # Provider routing, with Emergent at the end
-        default_order = ["local", "together", "openrouter", "emergent"]
-        order = []
-        if provider in ("local", "together", "openrouter", "emergent"):
-            order = [provider]
-            if self.enable_fallback:
-                for p in default_order:
-                    if p not in order:
-                        order.append(p)
+                return data.get("message", {}).get("content", "")
         else:
-            order = default_order
+            # Stream via OpenAI SSE style; fallback to single chunk
+            async def gen() -> AsyncGenerator[str, None]:
+                try:
+                    async with httpx.AsyncClient(timeout=self.timeout) as client:
+                        async with client.stream("POST", f"{self.local_base}/v1/chat/completions", json={**payload_openai, "stream": True}) as resp:
+                            async for line in resp.aiter_lines():
+                                if not line or not line.startswith("data: "):
+                                    continue
+                                data = line[6:]
+                                if data == "[DONE]":
+                                    break
+                                try:
+                                    j = httpx.Response(200, content=data).json()
+                                except Exception:
+                                    continue
+                                try:
+                                    delta = j.get("choices", [{}])[0].get("delta", {}).get("content")
+                                    if delta:
+                                        yield delta
+                                except Exception:
+                                    continue
+                except Exception:
+                    # fallback non-stream
+                    text = await self._local_chat(payload_openai, stream=False)
+                    if text:
+                        yield text
+                yield ""
+            return gen()
 
+    async def _together_chat(self, payload_openai: Dict[str, Any], stream: bool = False) -> Any:
+        if not self.together_key:
+            raise RuntimeError("Together not configured")
+        headers = {"Authorization": f"Bearer {self.together_key}", "Content-Type": "application/json"}
+        if not stream:
+            data = await self._post_json(f"{self.together_base}/chat/completions", payload_openai, headers)
+            return data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        else:
+            async def gen() -> AsyncGenerator[str, None]:
+                try:
+                    async with httpx.AsyncClient(timeout=self.timeout) as client:
+                        async with client.stream("POST", f"{self.together_base}/chat/completions", json={**payload_openai, "stream": True}, headers=headers) as resp:
+                            async for line in resp.aiter_lines():
+                                if not line or not line.startswith("data: "):
+                                    continue
+                                data = line[6:]
+                                if data == "[DONE]":
+                                    break
+                                try:
+                                    j = httpx.Response(200, content=data).json()
+                                except Exception:
+                                    continue
+                                delta = j.get("choices", [{}])[0].get("delta", {}).get("content")
+                                if delta:
+                                    yield delta
+                except Exception:
+                    yield ""
+                yield ""
+            return gen()
+
+    async def _openrouter_chat(self, payload_openai: Dict[str, Any], stream: bool = False) -> Any:
+        if not self.openrouter_key:
+            raise RuntimeError("OpenRouter not configured")
+        headers = {
+            "Authorization": f"Bearer {self.openrouter_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": os.environ.get("OPENROUTER_REFERRER", "http://localhost"),
+            "X-Title": os.environ.get("OPENROUTER_TITLE", "Neo System"),
+        }
+        if not stream:
+            data = await self._post_json(f"{self.openrouter_base}/chat/completions", payload_openai, headers)
+            return data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        else:
+            async def gen() -> AsyncGenerator[str, None]:
+                try:
+                    async with httpx.AsyncClient(timeout=self.timeout) as client:
+                        async with client.stream("POST", f"{self.openrouter_base}/chat/completions", json={**payload_openai, "stream": True}, headers=headers) as resp:
+                            async for line in resp.aiter_lines():
+                                if not line or not line.startswith("data: "):
+                                    continue
+                                data = line[6:]
+                                if data == "[DONE]":
+                                    break
+                                try:
+                                    j = httpx.Response(200, content=data).json()
+                                except Exception:
+                                    continue
+                                delta = j.get("choices", [{}])[0].get("delta", {}).get("content")
+                                if delta:
+                                    yield delta
+                except Exception:
+                    yield ""
+                yield ""
+            return gen()
+
+    async def _emergent_chat(self, model: str, messages: List[Dict[str, Any]], stream: bool = False) -> Any:
+        if not self.emergent_client:
+            raise RuntimeError("Emergent not configured")
+        if not stream:
+            resp = self.emergent_client.chat.completions.create(model=model, messages=messages)
+            return resp.choices[0].message.content
+        else:
+            # Fallback: stream not guaranteed; emit single chunk
+            resp = self.emergent_client.chat.completions.create(model=model, messages=messages)
+            async def gen() -> AsyncGenerator[str, None]:
+                yield resp.choices[0].message.content
+                yield ""
+            return gen()
+
+    async def _call_with_retry(self, func, provider: str, model: str, *args, stream: bool = False, **kwargs):
+        delay = 0.25
+        max_retries = 2
+        for attempt in range(max_retries + 1):
+            start = time.time()
+            try:
+                result = await func(*args, stream=stream, **kwargs)
+                LLM_LATENCY.labels(provider=provider, model=model).observe(time.time() - start)
+                return result
+            except httpx.TimeoutException as e:
+                telemetry.record_error(provider, model, "timeout", 504, str(e))
+                LLM_FAILURES.labels(provider=provider, model=model, code="timeout").inc()
+                self._breaker_trip(provider, err="timeout")
+                if attempt < max_retries:
+                    await asyncio_sleep(delay)
+                    delay *= 2
+                    continue
+                raise
+            except Exception as e:
+                telemetry.record_error(provider, model, "upstream_error", 502, str(e))
+                LLM_FAILURES.labels(provider=provider, model=model, code="upstream_error").inc()
+                self._breaker_trip(provider, err=str(e))
+                if attempt < max_retries:
+                    await asyncio_sleep(delay)
+                    delay *= 2
+                    continue
+                raise
+
+    async def chat(self, messages: List[Dict[str, Any]], model: str = "default", temperature: Optional[float] = None, max_tokens: Optional[int] = None, provider: Optional[str] = None, image_url: Optional[str] = None, image_b64: Optional[str] = None, image_mime: Optional[str] = None) -> Dict[str, Any]:
+        # Build payload
+        order_default = ["local", "together", "openrouter", "emergent"]
+        order = []
+        if provider in order_default:
+            order = [provider] + [p for p in order_default if p != provider] if self.enable_fallback else [provider]
+        else:
+            order = order_default
+
+        errors = []
         for p in order:
+            if not self._breaker_allows(p):
+                continue
+            resolved_model = self._resolve_model(p, model)
+            norm_messages = self._to_provider_messages(messages, image_url=image_url, image_b64=image_b64, image_mime=image_mime)
+            payload = {"model": resolved_model, "messages": norm_messages}
+            if temperature is not None:
+                payload["temperature"] = temperature
+            if max_tokens is not None:
+                payload["max_tokens"] = max_tokens
+            LLM_REQUESTS.labels(provider=p, model=resolved_model).inc()
             try:
                 if p == "local":
-                    res = await self._local_chat(payload)
+                    content = await self._call_with_retry(self._local_chat, p, resolved_model, payload, stream=False)
                 elif p == "together":
-                    res = await self._together_chat(payload)
+                    content = await self._call_with_retry(self._together_chat, p, resolved_model, payload, stream=False)
                 elif p == "openrouter":
-                    res = await self._openrouter_chat(payload)
+                    content = await self._call_with_retry(self._openrouter_chat, p, resolved_model, payload, stream=False)
                 else:
-                    res = await self._emergent_chat(payload)
-                if res and res.get("content"):
-                    return res
+                    content = await self._call_with_retry(self._emergent_chat, p, resolved_model, resolved_model, norm_messages, stream=False)
+                return {"provider": p, "model": resolved_model, "content": content}
             except Exception as e:
-                LOGGER.warning(f"Provider {p} error: {e}")
+                errors.append(self._err(p, 502, "upstream_error", str(e)))
                 continue
+        raise HTTPException(status_code=503, detail={"message": "All providers unavailable", "chain": errors})
 
-        raise HTTPException(status_code=503, detail="No LLM providers available or all failed")
+    async def stream(self, messages: List[Dict[str, Any]], model: str = "default", provider: Optional[str] = None, temperature: Optional[float] = None, max_tokens: Optional[int] = None, image_url: Optional[str] = None, image_b64: Optional[str] = None, image_mime: Optional[str] = None) -> AsyncGenerator[str, None]:
+        order_default = ["local", "together", "openrouter", "emergent"]
+        order = []
+        if provider in order_default:
+            order = [provider] + [p for p in order_default if p != provider] if self.enable_fallback else [provider]
+        else:
+            order = order_default
+
+        last_errors = []
+        for p in order:
+            if not self._breaker_allows(p):
+                continue
+            resolved_model = self._resolve_model(p, model)
+            norm_messages = self._to_provider_messages(messages, image_url=image_url, image_b64=image_b64, image_mime=image_mime)
+            payload = {"model": resolved_model, "messages": norm_messages}
+            if temperature is not None:
+                payload["temperature"] = temperature
+            if max_tokens is not None:
+                payload["max_tokens"] = max_tokens
+            LLM_REQUESTS.labels(provider=p, model=resolved_model).inc()
+            start = time.time()
+            try:
+                if p == "local":
+                    gen = await self._call_with_retry(self._local_chat, p, resolved_model, payload, stream=True)
+                elif p == "together":
+                    gen = await self._call_with_retry(self._together_chat, p, resolved_model, payload, stream=True)
+                elif p == "openrouter":
+                    gen = await self._call_with_retry(self._openrouter_chat, p, resolved_model, payload, stream=True)
+                else:
+                    gen = await self._call_with_retry(self._emergent_chat, p, resolved_model, resolved_model, norm_messages, stream=True)
+                # Yield chunks
+                async for chunk in gen:
+                    if chunk:
+                        yield chunk
+                telemetry.record_latency(p, resolved_model, time.time() - start)
+                return
+            except Exception as e:
+                telemetry.record_error(p, resolved_model, "upstream_error", 502, str(e))
+                last_errors.append(self._err(p, 502, "upstream_error", str(e)))
+                continue
+        # if all failed, emit error as last event
+        yield "\n[ERROR]: All providers unavailable"
+
+# Async sleep helper
+async def asyncio_sleep(seconds: float):
+    import asyncio
+    await asyncio.sleep(seconds)
 
 llm = LLMOrchestrator()
 
@@ -288,12 +548,17 @@ async def metrics():
 
 @api_router.get("/providers/status")
 async def providers_status():
-    status = {"local": False, "together": False, "openrouter": False, "emergent": False}
-    status["local"] = bool(llm.local_base)
-    status["together"] = bool(llm.together_key)
-    status["openrouter"] = bool(llm.openrouter_key)
-    status["emergent"] = bool(llm.emergent_client)
-    return status
+    return {
+        "local": bool(llm.local_base),
+        "together": bool(llm.together_key),
+        "openrouter": bool(llm.openrouter_key),
+        "emergent": bool(llm.emergent_client),
+        "breakers": llm.breakers,
+    }
+
+@api_router.get("/providers/telemetry")
+async def providers_telemetry():
+    return telemetry.snapshot()
 
 @api_router.post("/status", response_model=StatusCheck)
 async def create_status_check(input: StatusCheckCreate):
@@ -378,27 +643,14 @@ async def get_config():
     admin_enabled = os.environ.get("ADMIN_ENABLED", "false").lower() == "true"
     return {"admin_enabled": admin_enabled}
 
-# AI schemas
-class AIChatMessage(BaseModel):
-    role: Literal["user", "assistant", "system"]
-    content: str
-
-class AIChatRequest(BaseModel):
-    messages: List[AIChatMessage]
-    model: Optional[str] = Field(default="default")
-    temperature: Optional[float] = Field(default=0.7)
-    max_tokens: Optional[int] = Field(default=500)
-    provider: Optional[str] = Field(default=None)
-    image_url: Optional[str] = Field(default=None)
-
-class AISummaryRequest(BaseModel):
-    hours: Optional[int] = Field(default=24, ge=1, le=168)
-    limit: Optional[int] = Field(default=200, ge=1, le=2000)
-    model: Optional[str] = Field(default="default")
-    temperature: Optional[float] = Field(default=0.3)
-
+# AI endpoints
 @api_router.post("/ai/chat")
 async def ai_chat(req: AIChatRequest):
+    if LOG_SAMPLES:
+        try:
+            LOGGER.info(f"ai_chat sample: {str(req.dict())[:1024]}")
+        except Exception:
+            pass
     try:
         msgs = [m.dict() for m in req.messages]
         result = await llm.chat(
@@ -408,13 +660,44 @@ async def ai_chat(req: AIChatRequest):
             max_tokens=req.max_tokens,
             provider=req.provider,
             image_url=req.image_url,
+            image_b64=req.image_b64,
+            image_mime=req.image_mime,
         )
         return {"provider": result["provider"], "model": result["model"], "content": result["content"]}
-    except HTTPException:
-        raise
+    except HTTPException as he:
+        raise he
     except Exception as e:
         LOGGER.exception("AI chat failed")
-        raise HTTPException(status_code=503, detail="AI chat failed")
+        raise HTTPException(status_code=503, detail={"message": "AI chat failed", "error": str(e)})
+
+@api_router.post("/ai/chat/stream")
+async def ai_chat_stream(req: AIChatRequest):
+    if LOG_SAMPLES:
+        try:
+            LOGGER.info(f"ai_chat_stream sample: {str(req.dict())[:1024]}")
+        except Exception:
+            pass
+    async def event_gen() -> AsyncGenerator[bytes, None]:
+        try:
+            msgs = [m.dict() for m in req.messages]
+            async for chunk in llm.stream(
+                messages=msgs,
+                model=req.model or "default",
+                provider=req.provider,
+                temperature=req.temperature,
+                max_tokens=req.max_tokens,
+                image_url=req.image_url,
+                image_b64=req.image_b64,
+                image_mime=req.image_mime,
+            ):
+                if chunk:
+                    yield f"data: {chunk}\n\n".encode()
+            yield b"data: [DONE]\n\n"
+        except Exception as e:
+            err = {"message": str(e)}
+            yield f"data: {err}\n\n".encode()
+            yield b"data: [DONE]\n\n"
+    return StreamingResponse(event_gen(), media_type="text/event-stream")
 
 @api_router.post("/ai/summarize")
 async def ai_summarize(req: AISummaryRequest):
@@ -438,10 +721,6 @@ async def ai_summarize(req: AISummaryRequest):
     except Exception as e:
         LOGGER.exception("AI summarize failed")
         raise HTTPException(status_code=503, detail="AI summarize failed")
-
-class AIInsightsRequest(BaseModel):
-    hours: Optional[int] = Field(default=24, ge=1, le=720)
-    limit: Optional[int] = Field(default=500, ge=1, le=5000)
 
 @api_router.post("/ai/insights")
 async def ai_insights(req: AIInsightsRequest):
