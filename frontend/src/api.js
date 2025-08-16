@@ -26,6 +26,11 @@ export async function getConfig() {
   return data;
 }
 
+export async function getProvidersStatus() {
+  const { data } = await api.get(`/providers/status`);
+  return data;
+}
+
 // Status
 export async function createStatus(payload) {
   const { data } = await api.post(`/status`, payload);
@@ -65,5 +70,10 @@ export async function aiSummarize({ hours = 24, limit = 200, model = "default", 
 
 export async function aiInsights({ hours = 24, limit = 500 } = {}) {
   const { data } = await api.post(`/ai/insights`, { hours, limit });
+  return data;
+}
+
+export async function aiChat({ messages, model = "default", temperature = 0.7, max_tokens = 500, provider = null, image_url = null }) {
+  const { data } = await api.post(`/ai/chat`, { messages, model, temperature, max_tokens, provider, image_url });
   return data;
 }

@@ -4,6 +4,7 @@ import { BrowserRouter, Routes, Route, Link } from "react-router-dom";
 import { Toaster, toast } from "sonner";
 import { createStatus, getConfig, getHealth, getStatusCounts, getVersion, listStatus } from "./api";
 import AdminPage from "./pages/Admin";
+import ChatPage from "./pages/Chat";
 
 const Home = () => {
   const [health, setHealth] = useState(null);
@@ -219,11 +220,13 @@ function Shell() {
       <nav className="bg-black/40 border-b border-gray-800">
         <div className="max-w-5xl mx-auto px-4 py-3 flex items-center gap-4">
           <Link to="/" className="text-white">Home</Link>
+          <Link to="/chat" className="text-white">Chat</Link>
           {adminEnabled && <Link to="/admin" className="text-white">Admin</Link>}
         </div>
       </nav>
       <Routes>
         <Route path="/" element={<Home />} />
+        <Route path="/chat" element={<ChatPage />} />
         {adminEnabled && <Route path="/admin" element={<AdminPage />} />}
       </Routes>
     </div>

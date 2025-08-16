@@ -6,7 +6,7 @@ import os
 import logging
 from pathlib import Path
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Literal
 import uuid
 from datetime import datetime, timedelta
 import httpx
@@ -27,7 +27,7 @@ db = client[os.environ['DB_NAME']]
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 LOGGER = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
@@ -41,8 +41,6 @@ async def metrics_logging_middleware(request: Request, call_next):
     trace_id = request.headers.get("x-request-id", str(uuid.uuid4()))
     path = request.url.path
     method = request.method
-    # simple path normalization: collapse ids
-    norm_path = path.replace(request.app.router.prefix if hasattr(request.app, 'router') else "", "")
     try:
         response: Response = await call_next(request)
         status = response.status_code
@@ -54,7 +52,10 @@ async def metrics_logging_middleware(request: Request, call_next):
             REQ_LATENCY.labels(method=method, path=path).observe(duration)
         except Exception:
             pass
-        LOGGER.info(f"trace_id=%s method=%s path=%s status=%s latency_ms=%.2f", trace_id, method, path, (response.status_code if 'response' in locals() else 'NA'), duration * 1000)
+        LOGGER.info(
+            "trace_id=%s method=%s path=%s status=%s latency_ms=%.2f",
+            trace_id, method, path, (response.status_code if 'response' in locals() else 'NA'), duration * 1000
+        )
 
 # Models
 class StatusCheck(BaseModel):
@@ -103,12 +104,13 @@ def strip_mongo_id(doc: Dict[str, Any]) -> Dict[str, Any]:
 # LLM Orchestrator
 class LLMOrchestrator:
     def __init__(self):
-        self.local_base = os.environ.get("LLM_LOCAL_BASE_URL")  # e.g. http://127.0.0.1:8080
+        self.local_base = os.environ.get("LLM_LOCAL_BASE_URL")  # e.g. http://127.0.0.1:11434 or vLLM base
         self.together_base = os.environ.get("TOGETHER_BASE_URL", "https://api.together.xyz/v1")
         self.together_key = os.environ.get("TOGETHER_API_KEY")
         self.openrouter_base = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
         self.openrouter_key = os.environ.get("OPENROUTER_API_KEY")
         self.timeout = float(os.environ.get("LLM_TIMEOUT", "45"))
+        self.enable_fallback = os.environ.get("ENABLE_LLM_FALLBACK", "true").lower() == "true"
 
     async def _post_json(self, url: str, payload: Dict[str, Any], headers: Dict[str, str] = None) -> Dict[str, Any]:
         async with httpx.AsyncClient(timeout=self.timeout) as client:
@@ -116,51 +118,122 @@ class LLMOrchestrator:
             r.raise_for_status()
             return r.json()
 
-    async def chat(self, messages: List[Dict[str, str]], model: str = "default", temperature: Optional[float] = None, max_tokens: Optional[int] = None) -> Dict[str, Any]:
+    async def _local_chat(self, payload_openai: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not self.local_base:
+            return None
+        # Try OpenAI-compatible first
+        try:
+            data = await self._post_json(f"{self.local_base}/v1/chat/completions", payload_openai)
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            if content:
+                return {"provider": "local", "model": data.get("model", payload_openai.get("model", "default")), "content": content, "raw": data}
+        except Exception as e:
+            # Try Ollama-compatible /api/chat
+            try:
+                ollama_payload = {
+                    "model": payload_openai.get("model", "llama3"),
+                    "messages": payload_openai.get("messages", []),
+                    "stream": False
+                }
+                data = await self._post_json(f"{self.local_base}/api/chat", ollama_payload)
+                # Ollama returns { message: { role, content }, ... }
+                content = data.get("message", {}).get("content")
+                if content:
+                    return {"provider": "local", "model": ollama_payload["model"], "content": content, "raw": data}
+            except Exception as e2:
+                LOGGER.warning(f"Local LLM failed (OpenAI and Ollama paths): {e} | {e2}")
+        return None
+
+    async def _together_chat(self, payload_openai: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not self.together_key:
+            return None
+        try:
+            headers = {"Authorization": f"Bearer {self.together_key}", "Content-Type": "application/json"}
+            data = await self._post_json(f"{self.together_base}/chat/completions", payload_openai, headers)
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            if content:
+                return {"provider": "together", "model": data.get("model", payload_openai.get("model", "default")), "content": content, "raw": data}
+        except Exception as e:
+            LOGGER.warning(f"Together.ai failed: {e}")
+        return None
+
+    async def _openrouter_chat(self, payload_openai: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not self.openrouter_key:
+            return None
+        try:
+            headers = {
+                "Authorization": f"Bearer {self.openrouter_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": os.environ.get("OPENROUTER_REFERRER", "http://localhost"),
+                "X-Title": os.environ.get("OPENROUTER_TITLE", "Neo System")
+            }
+            data = await self._post_json(f"{self.openrouter_base}/chat/completions", payload_openai, headers)
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            if content:
+                return {"provider": "openrouter", "model": data.get("model", payload_openai.get("model", "default")), "content": content, "raw": data}
+        except Exception as e:
+            LOGGER.warning(f"OpenRouter failed: {e}")
+        return None
+
+    async def chat(self, messages: List[Dict[str, Any]], model: str = "default", temperature: Optional[float] = None, max_tokens: Optional[int] = None, provider: Optional[str] = None, image_url: Optional[str] = None) -> Dict[str, Any]:
+        # Build OpenAI-style payload
+        formatted_messages = []
+        for m in messages:
+            role = m.get("role", "user")
+            content = m.get("content", "")
+            # If image is provided and this is the last user message, include multimodal content array
+            formatted_messages.append({"role": role, "content": content})
+        if image_url:
+            # Attach image to last message (if last is user), else append a new user message with image
+            if formatted_messages and formatted_messages[-1]["role"] == "user":
+                text_part = formatted_messages[-1]["content"]
+                formatted_messages[-1]["content"] = [
+                    {"type": "text", "text": text_part},
+                    {"type": "image_url", "image_url": {"url": image_url}}
+                ]
+            else:
+                formatted_messages.append({
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": image_url}}
+                    ]
+                })
+
         payload = {
             "model": model,
-            "messages": messages,
+            "messages": formatted_messages,
         }
         if temperature is not None:
             payload["temperature"] = temperature
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
 
-        # Provider order: Local -> Together -> OpenRouter
-        # Local
-        if self.local_base:
+        # Provider routing
+        order = []
+        if provider in ("local", "together", "openrouter"):
+            order = [provider]
+            if self.enable_fallback:
+                # add the others in default order for fallback
+                for p in ["local", "together", "openrouter"]:
+                    if p not in order:
+                        order.append(p)
+        else:
+            order = ["local", "together", "openrouter"]
+
+        for p in order:
             try:
-                data = await self._post_json(f"{self.local_base}/v1/chat/completions", payload)
-                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                if content:
-                    return {"provider": "local", "model": data.get("model", model), "content": content, "raw": data}
+                if p == "local":
+                    res = await self._local_chat(payload)
+                elif p == "together":
+                    res = await self._together_chat(payload)
+                else:
+                    res = await self._openrouter_chat(payload)
+                if res and res.get("content"):
+                    return res
             except Exception as e:
-                LOGGER.warning(f"Local LLM failed: {e}")
-        # Together
-        if self.together_key:
-            try:
-                headers = {"Authorization": f"Bearer {self.together_key}", "Content-Type": "application/json"}
-                data = await self._post_json(f"{self.together_base}/chat/completions", payload, headers)
-                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                if content:
-                    return {"provider": "together", "model": data.get("model", model), "content": content, "raw": data}
-            except Exception as e:
-                LOGGER.warning(f"Together.ai failed: {e}")
-        # OpenRouter
-        if self.openrouter_key:
-            try:
-                headers = {
-                    "Authorization": f"Bearer {self.openrouter_key}",
-                    "Content-Type": "application/json",
-                    "HTTP-Referer": os.environ.get("OPENROUTER_REFERRER", "http://localhost"),
-                    "X-Title": os.environ.get("OPENROUTER_TITLE", "Unrestricted App")
-                }
-                data = await self._post_json(f"{self.openrouter_base}/chat/completions", payload, headers)
-                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                if content:
-                    return {"provider": "openrouter", "model": data.get("model", model), "content": content, "raw": data}
-            except Exception as e:
-                LOGGER.warning(f"OpenRouter failed: {e}")
+                LOGGER.warning(f"Provider {p} error: {e}")
+                continue
+
         raise HTTPException(status_code=503, detail="No LLM providers available or all failed")
 
 llm = LLMOrchestrator()
@@ -187,6 +260,15 @@ async def version():
 @api_router.get("/metrics")
 async def metrics():
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+@api_router.get("/providers/status")
+async def providers_status():
+    status = {"local": False, "together": False, "openrouter": False}
+    # Config presence
+    status["local"] = bool(llm.local_base)
+    status["together"] = bool(llm.together_key)
+    status["openrouter"] = bool(llm.openrouter_key)
+    return status
 
 @api_router.post("/status", response_model=StatusCheck)
 async def create_status_check(input: StatusCheckCreate):
@@ -256,7 +338,6 @@ async def purge_status(req: PurgeRequest):
             cutoff = datetime.utcnow() - timedelta(hours=req.older_than_hours)
             query["timestamp"] = {"$lt": cutoff}
         if not query:
-            # if no filters, require explicit confirmation via env UNSAFE_PURGE_ALL=true
             if os.environ.get("UNSAFE_PURGE_ALL", "false").lower() != "true":
                 raise HTTPException(status_code=400, detail="Refusing to purge all without UNSAFE_PURGE_ALL=true")
         res = await db.status_checks.delete_many(query)
@@ -273,12 +354,43 @@ async def get_config():
     admin_enabled = os.environ.get("ADMIN_ENABLED", "false").lower() == "true"
     return {"admin_enabled": admin_enabled}
 
-# AI endpoints
+# AI schemas
+class AIChatMessage(BaseModel):
+    role: Literal["user", "assistant", "system"]
+    content: str
+
+class AIChatRequest(BaseModel):
+    messages: List[AIChatMessage]
+    model: Optional[str] = Field(default="default")
+    temperature: Optional[float] = Field(default=0.7)
+    max_tokens: Optional[int] = Field(default=500)
+    provider: Optional[str] = Field(default=None)
+    image_url: Optional[str] = Field(default=None)
+
 class AISummaryRequest(BaseModel):
     hours: Optional[int] = Field(default=24, ge=1, le=168)
     limit: Optional[int] = Field(default=200, ge=1, le=2000)
     model: Optional[str] = Field(default="default")
     temperature: Optional[float] = Field(default=0.3)
+
+@api_router.post("/ai/chat")
+async def ai_chat(req: AIChatRequest):
+    try:
+        msgs = [m.dict() for m in req.messages]
+        result = await llm.chat(
+            messages=msgs,
+            model=req.model or "default",
+            temperature=req.temperature,
+            max_tokens=req.max_tokens,
+            provider=req.provider,
+            image_url=req.image_url,
+        )
+        return {"provider": result["provider"], "model": result["model"], "content": result["content"]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        LOGGER.exception("AI chat failed")
+        raise HTTPException(status_code=503, detail="AI chat failed")
 
 @api_router.post("/ai/summarize")
 async def ai_summarize(req: AISummaryRequest):
@@ -288,7 +400,6 @@ async def ai_summarize(req: AISummaryRequest):
         rows = await cursor.to_list(length=req.limit or 200)
         if not rows:
             return {"provider": None, "model": req.model, "content": "No status events in the selected window."}
-        # Build prompt
         lines = [f"{r['timestamp']} - {r['client_name']} - {r['id']}" for r in rows]
         prompt = (
             "You are an SRE assistant. Given recent system status events (client name and timestamp), "
