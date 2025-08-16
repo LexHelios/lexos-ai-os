@@ -10,6 +10,7 @@ export const api = axios.create({
   baseURL: `${BACKEND_URL}/api`,
 });
 
+// Core
 export async function getHealth() {
   const { data } = await api.get(`/health`);
   return data;
@@ -20,6 +21,12 @@ export async function getVersion() {
   return data;
 }
 
+export async function getConfig() {
+  const { data } = await api.get(`/config`);
+  return data;
+}
+
+// Status
 export async function createStatus(payload) {
   const { data } = await api.post(`/status`, payload);
   return data;
@@ -36,5 +43,27 @@ export async function listStatus({ limit = 10, offset = 0, q = "" } = {}) {
 
 export async function getStatusCounts() {
   const { data } = await api.get(`/status/count`);
+  return data;
+}
+
+export function exportStatusCSV(client = "") {
+  const url = new URL(`${BACKEND_URL}/api/status/export`);
+  if (client) url.searchParams.set("client", client);
+  window.location.href = url.toString();
+}
+
+export async function purgeStatus({ client_name = "", older_than_hours = null } = {}) {
+  const { data } = await api.post(`/status/purge`, { client_name, older_than_hours });
+  return data;
+}
+
+// AI
+export async function aiSummarize({ hours = 24, limit = 200, model = "default", temperature = 0.3 } = {}) {
+  const { data } = await api.post(`/ai/summarize`, { hours, limit, model, temperature });
+  return data;
+}
+
+export async function aiInsights({ hours = 24, limit = 500 } = {}) {
+  const { data } = await api.post(`/ai/insights`, { hours, limit });
   return data;
 }

@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 import "./App.css";
-import { BrowserRouter, Routes, Route } from "react-router-dom";
+import { BrowserRouter, Routes, Route, Link } from "react-router-dom";
 import { Toaster, toast } from "sonner";
-import { createStatus, getHealth, getStatusCounts, getVersion, listStatus } from "./api";
+import { createStatus, getConfig, getHealth, getStatusCounts, getVersion, listStatus } from "./api";
+import AdminPage from "./pages/Admin";
 
 const Home = () => {
   const [health, setHealth] = useState(null);
@@ -207,13 +208,33 @@ const Home = () => {
   );
 };
 
+function Shell() {
+  const [adminEnabled, setAdminEnabled] = useState(false);
+  useEffect(() => {
+    getConfig().then((cfg) => setAdminEnabled(!!cfg.admin_enabled)).catch(() => setAdminEnabled(false));
+  }, []);
+
+  return (
+    <div className="min-h-screen">
+      <nav className="bg-black/40 border-b border-gray-800">
+        <div className="max-w-5xl mx-auto px-4 py-3 flex items-center gap-4">
+          <Link to="/" className="text-white">Home</Link>
+          {adminEnabled && <Link to="/admin" className="text-white">Admin</Link>}
+        </div>
+      </nav>
+      <Routes>
+        <Route path="/" element={<Home />} />
+        {adminEnabled && <Route path="/admin" element={<AdminPage />} />}
+      </Routes>
+    </div>
+  );
+}
+
 function App() {
   return (
     <div className="App">
       <BrowserRouter>
-        <Routes>
-          <Route path="/" element={<Home />}></Route>
-        </Routes>
+        <Shell />
       </BrowserRouter>
     </div>
   );
