@@ -15,6 +15,12 @@ import csv
 from io import StringIO
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
+# Emergent Integrations
+try:
+    from emergentintegrations import EmergentLLM  # type: ignore
+except Exception:
+    EmergentLLM = None
+
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
@@ -27,7 +33,7 @@ db = client[os.environ['DB_NAME']]
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 LOGGER = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
@@ -111,6 +117,9 @@ class LLMOrchestrator:
         self.openrouter_key = os.environ.get("OPENROUTER_API_KEY")
         self.timeout = float(os.environ.get("LLM_TIMEOUT", "45"))
         self.enable_fallback = os.environ.get("ENABLE_LLM_FALLBACK", "true").lower() == "true"
+        # Emergent
+        self.emergent_key = os.environ.get("EMERGENT_LLM_KEY")
+        self.emergent_client = EmergentLLM(api_key=self.emergent_key) if (EmergentLLM and self.emergent_key) else None
 
     async def _post_json(self, url: str, payload: Dict[str, Any], headers: Dict[str, str] = None) -> Dict[str, Any]:
         async with httpx.AsyncClient(timeout=self.timeout) as client:
@@ -136,7 +145,6 @@ class LLMOrchestrator:
                     "stream": False
                 }
                 data = await self._post_json(f"{self.local_base}/api/chat", ollama_payload)
-                # Ollama returns { message: { role, content }, ... }
                 content = data.get("message", {}).get("content")
                 if content:
                     return {"provider": "local", "model": ollama_payload["model"], "content": content, "raw": data}
@@ -175,16 +183,31 @@ class LLMOrchestrator:
             LOGGER.warning(f"OpenRouter failed: {e}")
         return None
 
+    async def _emergent_chat(self, payload_openai: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not self.emergent_client:
+            return None
+        try:
+            # Emergent Integrations accepts OpenAI-style messages and model routing using Universal Key
+            resp = self.emergent_client.chat.completions.create(
+                model=payload_openai.get("model", "gpt-4"),
+                messages=payload_openai.get("messages", []),
+            )
+            # resp.choices[0].message.content
+            content = getattr(resp.choices[0].message, "content", None) if hasattr(resp, "choices") else None
+            if content:
+                return {"provider": "emergent", "model": payload_openai.get("model", "gpt-4"), "content": content, "raw": None}
+        except Exception as e:
+            LOGGER.warning(f"Emergent provider failed: {e}")
+        return None
+
     async def chat(self, messages: List[Dict[str, Any]], model: str = "default", temperature: Optional[float] = None, max_tokens: Optional[int] = None, provider: Optional[str] = None, image_url: Optional[str] = None) -> Dict[str, Any]:
         # Build OpenAI-style payload
         formatted_messages = []
         for m in messages:
             role = m.get("role", "user")
             content = m.get("content", "")
-            # If image is provided and this is the last user message, include multimodal content array
             formatted_messages.append({"role": role, "content": content})
         if image_url:
-            # Attach image to last message (if last is user), else append a new user message with image
             if formatted_messages and formatted_messages[-1]["role"] == "user":
                 text_part = formatted_messages[-1]["content"]
                 formatted_messages[-1]["content"] = [
@@ -208,17 +231,17 @@ class LLMOrchestrator:
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
 
-        # Provider routing
+        # Provider routing, with Emergent at the end
+        default_order = ["local", "together", "openrouter", "emergent"]
         order = []
-        if provider in ("local", "together", "openrouter"):
+        if provider in ("local", "together", "openrouter", "emergent"):
             order = [provider]
             if self.enable_fallback:
-                # add the others in default order for fallback
-                for p in ["local", "together", "openrouter"]:
+                for p in default_order:
                     if p not in order:
                         order.append(p)
         else:
-            order = ["local", "together", "openrouter"]
+            order = default_order
 
         for p in order:
             try:
@@ -226,8 +249,10 @@ class LLMOrchestrator:
                     res = await self._local_chat(payload)
                 elif p == "together":
                     res = await self._together_chat(payload)
-                else:
+                elif p == "openrouter":
                     res = await self._openrouter_chat(payload)
+                else:
+                    res = await self._emergent_chat(payload)
                 if res and res.get("content"):
                     return res
             except Exception as e:
@@ -263,11 +288,11 @@ async def metrics():
 
 @api_router.get("/providers/status")
 async def providers_status():
-    status = {"local": False, "together": False, "openrouter": False}
-    # Config presence
+    status = {"local": False, "together": False, "openrouter": False, "emergent": False}
     status["local"] = bool(llm.local_base)
     status["together"] = bool(llm.together_key)
     status["openrouter"] = bool(llm.openrouter_key)
+    status["emergent"] = bool(llm.emergent_client)
     return status
 
 @api_router.post("/status", response_model=StatusCheck)
@@ -315,7 +340,6 @@ async def export_status(client: Optional[str] = Query(default=None), limit: int 
             query["client_name"] = client
         cursor = db.status_checks.find(query, projection={"_id": 0}).sort("timestamp", -1).limit(limit)
         rows = await cursor.to_list(length=limit)
-        # Build CSV
         output = StringIO()
         writer = csv.writer(output)
         writer.writerow(["id", "client_name", "timestamp"])
